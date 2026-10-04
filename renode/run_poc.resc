@@ -1,0 +1,63 @@
+:name: AM64x RPMsg POC
+:description: ZynqMP stand-in for the AM64x. Linux userspace on the A53 (apu0) talks RPMsg to Zephyr on the R5F (rpu0) over the ZynqMP IPI.
+
+# Run from the repository root after scripts/build_and_run.sh has produced the
+# build artifacts. Linux console: uart1. Zephyr console: uart0.
+
+using sysbus
+using sysbus.cluster0
+using sysbus.cluster1
+
+$name?="AM64x_RPMsg_POC"
+mach create $name
+
+machine LoadPlatformDescription @renode/am64_zynqmp.repl
+machine SetSerialExecution True
+
+# Renode's ZynqMP_IPI stores whatever is written to an ISR register and only
+# clears it when exactly one channel bit is written. Real ISRs are
+# write-1-to-clear, and Zephyr's IPI driver clears them all at init by writing
+# 0xFFFFFFFF, which would leave every bit set and cause an interrupt storm on
+# the first kick. Reduce ISR writes to the bits that are actually pending.
+sysbus SetHookBeforePeripheralWrite ipi """
+from System import UInt64
+if (offset & 0xFFF) == 0x10:
+    pending = int(self.ReadDoubleWord(offset)) & int(value)
+    if pending & (pending - 1) == 0:
+        value = UInt64(pending)
+"""
+
+# Built locally (scripts/build_and_run.sh)
+$dtb?=      @build/am64_rpmsg_poc.dtb
+$rootfs?=   @build/rootfs.ext2
+$zephyr?=   @zephyr_app/build/zephyr/zephyr.elf
+
+# Antmicro's ZynqMP OpenAMP demo firmware and kernel (Linux 6.6.10)
+$atf_elf?=  @https://dl.antmicro.com/projects/renode/zynq-us_plus--bl31.elf-s_770984-aad9c28d989600caa8fd436bca66eb500e0606dd
+$uboot?=    @https://dl.antmicro.com/projects/renode/zynq-us_plus--u-boot.bin-s_1351888-8291c2fd5e7fed3bda101e4c0694991fb40af277
+$linux?=    @https://dl.antmicro.com/projects/renode/zynqmp--linux-Image-openamp-s_23429632-e9ff8dd5c5963153dd87791cc250dea3c039cbbc
+
+$bootargs?="earlycon console=ttyPS1,115200n8 root=/dev/ram0 rw initrd=0x20000000,64M uio_pdrv_genirq.of_id=generic-uio"
+
+showAnalyzer uart1
+showAnalyzer uart0
+
+macro reset
+"""
+    apu0 PC 0x1000000
+    cluster0 IsHalted true
+    apu0 IsHalted false
+
+    cluster1 IsHalted true
+    rpu0 IsHalted false
+
+    sysbus LoadELF    $atf_elf cpu=apu0
+    sysbus LoadFdt    $dtb    0x100000   $bootargs false context=apu0
+    sysbus LoadBinary $uboot  0x8000000  cpu=apu0
+    sysbus LoadBinary $linux  0x10000000 cpu=apu0
+    sysbus LoadBinary $rootfs 0x20000000 cpu=apu0
+
+    sysbus LoadELF    $zephyr cpu=rpu0
+"""
+
+runMacro $reset

@@ -1,0 +1,16 @@
+// ZynqMP stand-in for the AM64x RPMsg POC.
+// The mailbox is the stock ZynqMP IPI (sysbus.ipi @ 0xff300000):
+//   APU IPI channel 7  (0xff340000, bit 24, SPI 29) <-> RPU0 IPI channel 1 (0xff310000, bit 8, SPI 33)
+using "platforms/cpus/zynqmp.repl"
+
+// R5F (Zephyr) RAM, kept outside the DDR that Linux owns
+r5_ram: Memory.MappedMemory @ sysbus 0xA0000000
+    size: 0x100000
+
+// Resource table, published here by the R5F at boot
+rsc_table: Memory.MappedMemory @ sysbus 0xA0100000
+    size: 0x1000
+
+// Shared SRAM for OpenAMP: VRING0 @ +0x0, VRING1 @ +0x4000, RPMsg buffers from +0x8000
+shared_sram: Memory.MappedMemory @ sysbus 0xA5000000
+    size: 0x100000

@@ -1,29 +1,58 @@
-#include <openamp/open_amp.h>
-#include <metal/sys.h>
+#include <string.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/sys/util.h>
+#include "rsc_table.h"
 
-#define SHM_BASE 0xA5000000
-#define VRING_TX 0xA5000000
-#define VRING_RX 0xA5004000
-#define VRING_ALIGN 4096
-#define NUM_VRINGS 2
+#define RSC_TABLE_NODE DT_CHOSEN(zephyr_ipc_rsc_table)
+#define SHM_NODE       DT_CHOSEN(zephyr_ipc_shm)
 
-/* Resource table for the AM64x R5F */
-struct fw_resource_table {
-    unsigned int ver;
-    unsigned int num;
-    unsigned int reserved[2];
-    unsigned int offset[1];
-    struct fw_rsc_vdev vdev;
-    struct fw_rsc_vdev_vring vring0;
-    struct fw_rsc_vdev_vring vring1;
-} __attribute__((packed));
+/* VRING0 and VRING1 sit at the start of the shared SRAM, 16 KB apart */
+#define VRING0_ADDR (DT_REG_ADDR(SHM_NODE))
+#define VRING1_ADDR (DT_REG_ADDR(SHM_NODE) + 0x4000)
 
-const struct fw_resource_table resource_table __attribute__((section(".resource_table"))) = {
-    1, 1, {0, 0},
-    { offsetof(struct fw_resource_table, vdev) },
-    {
-        RSC_VDEV, 7, 0, 0, 0, NUM_VRINGS, {0, 0},
-    },
-    { VRING_TX, VRING_ALIGN, 256, 1, 0 },
-    { VRING_RX, VRING_ALIGN, 256, 2, 0 },
+BUILD_ASSERT(sizeof(struct am64_rsc_table) <= DT_REG_SIZE(RSC_TABLE_NODE),
+	     "resource table does not fit in zephyr,ipc_rsc_table");
+
+/*
+ * Nothing loads this firmware through remoteproc, so the A53 cannot read the
+ * table from the ELF. Instead it is copied at boot to a fixed address that the
+ * A53 maps through UIO.
+ */
+static const struct am64_rsc_table rsc_table_template = {
+	.hdr = {
+		.ver = 1,
+		.num = ARRAY_SIZE(rsc_table_template.offset),
+	},
+	.offset = { offsetof(struct am64_rsc_table, vdev) },
+	.vdev = {
+		.type = RSC_VDEV,
+		.id = VIRTIO_ID_RPMSG,
+		.notifyid = VDEV_NOTIFYID,
+		.dfeatures = BIT(VIRTIO_RPMSG_F_NS),
+		.gfeatures = 0,
+		.config_len = 0,
+		.status = 0,
+		.num_of_vrings = VRING_COUNT,
+	},
+	.vring0 = {
+		.da = VRING0_ADDR,
+		.align = VRING_ALIGN,
+		.num = VRING_NUM_DESCS,
+		.notifyid = VRING0_NOTIFYID,
+	},
+	.vring1 = {
+		.da = VRING1_ADDR,
+		.align = VRING_ALIGN,
+		.num = VRING_NUM_DESCS,
+		.notifyid = VRING1_NOTIFYID,
+	},
 };
+
+struct am64_rsc_table *rsc_table_publish(void)
+{
+	struct am64_rsc_table *table = (struct am64_rsc_table *)DT_REG_ADDR(RSC_TABLE_NODE);
+
+	memcpy(table, &rsc_table_template, sizeof(*table));
+
+	return table;
+}

@@ -4,55 +4,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Proof of concept for an OpenAMP/RPMsg link between a Cortex-A53 (Linux, master) and a Cortex-R5F (Zephyr, remote), aimed at the TI AM6442 SoC and simulated entirely in **Renode**. Renode has no AM64x model, so a **ZynqMP platform stands in** for it, with a Python peripheral mocking the TI mailbox. The design spec that drives this work is [antigravity_agent_spec_am64x_rpmsg_poc.md](antigravity_agent_spec_am64x_rpmsg_poc.md); read it before making structural changes. Its acceptance criterion: the Linux console shows the userspace app sending `"ping"` and the Zephyr UART prints `OpenAMP: Received message: "ping"`.
+Proof of concept for an OpenAMP/RPMsg link between a Cortex-A53 (Linux, RPMsg host) and a Cortex-R5F (Zephyr, remote), aimed at the TI AM6442 SoC and simulated entirely in **Renode**. Renode has no AM64x model, so a **ZynqMP platform stands in** for it, and the stock **ZynqMP IPI** stands in for the TI mailbox. The design spec is [docs/antigravity_agent_spec_am64x_rpmsg_poc.md](docs/antigravity_agent_spec_am64x_rpmsg_poc.md); read it before making structural changes. Its acceptance criterion: the Linux console shows the userspace app sending `"ping"` and the Zephyr UART prints `OpenAMP: Received message: "ping"`. The POC also replies `"pong"` so both directions are exercised.
 
-The A53 side was moved from a kernel module to a **userspace app** (libmetal + libopen_amp over `generic-uio`). Don't reintroduce a kernel driver (`am64_rpmsg_client.c` was deleted on purpose).
+The A53 side is a **userspace app** (libmetal + libopen_amp over `generic-uio`). Don't reintroduce a kernel driver (`am64_rpmsg_client.c` was deleted on purpose). The Python mailbox mock was replaced by the ZynqMP IPI on purpose: `PythonPeripheral` can't drive IRQ lines.
+
+## Layout
+
+- `linux_app/`: A53 userspace app and DT overlay
+- `zephyr_app/`: R5F Zephyr firmware (`dts/bindings/` holds an app-local binding for the mailbox consumer node)
+- `renode/`: platform, simulation script, acceptance test (Renode is run from the repo root, so paths in these files are root-relative)
+- `scripts/`: `build_and_run.sh`; `scripts/experiments/` holds throwaway scripts
+- `docs/`: design spec
+- `build/` (generated): Linux DTB, rootfs, downloads, test results
 
 ## Build & run
 
-Everything is meant to run inside the Docker image built from [Dockerfile](Dockerfile). It is based on `zephyrprojectrtos/ci`, adds Renode 1.15.3 at `/opt/renode`, and cross-compiles libsysfs, libmetal and open-amp (`v2024.05.0`) into the `/usr/aarch64-linux-gnu` sysroot.
+Everything runs inside the image built from [Dockerfile](Dockerfile). It is based on `zephyrprojectrtos/ci`, which already ships Renode 1.16 (`/opt/renode`), the Zephyr SDK, dtc and debugfs. The Dockerfile adds the AArch64 glibc cross compiler and builds libsysfs, libmetal and open-amp (`v2024.05.0`) as static libraries into the `/usr/aarch64-linux-gnu` sysroot. Podman works the same as Docker (add `:Z` to the volume on SELinux hosts).
 
 ```bash
 docker build -t rpmsg-poc .
-docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./build_and_run.sh
+docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh              # build + acceptance test
+docker run --rm -it -p 3456:3456 -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh interactive  # Linux console on telnet localhost 3456
+docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh build        # build only
 ```
 
-[build_and_run.sh](build_and_run.sh) runs these steps, which you can also run on their own:
+[scripts/build_and_run.sh](scripts/build_and_run.sh) creates the west workspace in `zephyrproject/` (Zephyr `v4.5.0-rc1`, only the open-amp, libmetal and cmsis modules), builds the Zephyr ELF for `qemu_cortex_r5`, statically links the userspace app, merges the DT overlay into Antmicro's OpenAMP DTB with `fdtoverlay`, and copies Antmicro's OpenAMP rootfs into `build/rootfs.ext2` with `debugfs`. The rootfs gets the app at `/root/am64_rpmsg_userspace` and an init script that runs `modprobe uio_pdrv_genirq of_id=generic-uio`.
 
-```bash
-# Zephyr R5F firmware (run from zephyrproject/; west workspace, Zephyr 4.5.0-rc1)
-cd zephyrproject && west build -p always -b qemu_cortex_r5 ../zephyr_app -d ../zephyr_app/build
+The acceptance test is [renode/rpmsg_poc.robot](renode/rpmsg_poc.robot) (`renode-test renode/rpmsg_poc.robot`). It boots everything, logs in as root on uart1, runs the app and checks both UARTs. It takes about 45 s. The app does one handshake per boot: rerunning it without restarting the simulation won't work, because the R5F doesn't handle a vdev reset.
 
-# A53 userspace app (needs the cross-compiled libs from the Docker image)
-aarch64-linux-gnu-gcc -O2 -o am64_rpmsg_userspace am64_rpmsg_userspace.c -lopen_amp -lmetal
-
-# Renode, headless
-renode -e "s @run_poc.resc; start" --disable-x11
-```
-
-`zephyrproject/` is the west workspace and is owned by root because it was created inside the container. Don't edit it. `test_dpkg.sh` and `test_multiarch.sh` are throwaway experiments for getting arm64 libsysfs into the container; they are not tests. The repo has no unit tests or linter.
+`zephyrproject/` is the west workspace. Don't edit it. `scripts/experiments/test_dpkg.sh` and `test_multiarch.sh` are throwaway experiments from getting arm64 libsysfs into the container; they are not tests.
 
 ## Architecture
 
-The parts only work if they agree on one memory map, which is spread across several files. **Change all of them together:**
+The parts only work if they agree on one memory map and IPI assignment, which are spread across several files. **Change all of them together:**
 
 | Item | Address | Defined in |
 |---|---|---|
-| Shared SRAM (vrings + buffers), 1 MB | `0xA5000000` | `am64_zynqmp.repl`, `am64_rpmsg_overlay.dts`, `zephyr_app/app.overlay`, `zephyr_app/src/rsc_table.c` |
-| VRING0 / VRING1 (4K aligned, 256 entries) | `0xA5000000` / `0xA5004000` | `rsc_table.c`, `am64_rpmsg_overlay.dts` (reserved-memory) |
-| Resource table | `0xA0100000` | `am64_zynqmp.repl` |
-| Mock mailbox (UIO on Linux) | `0x2A000000`, IRQ 100 → `rpu0` | `am64_zynqmp.repl`, `am64_rpmsg_overlay.dts` |
+| R5F (Zephyr) RAM, 1 MB, outside Linux's DDR | `0xA0000000` | `renode/am64_zynqmp.repl`, `zephyr_app/app.overlay` |
+| Resource table, 4 KB | `0xA0100000` | `renode/am64_zynqmp.repl`, `zephyr_app/app.overlay`, `linux_app/am64_rpmsg_overlay.dts`, `linux_app/am64_rpmsg_userspace.c` (UIO name) |
+| Shared SRAM, 1 MB | `0xA5000000` | `renode/am64_zynqmp.repl`, `zephyr_app/app.overlay`, `linux_app/am64_rpmsg_overlay.dts`, `linux_app/am64_rpmsg_userspace.c` (UIO name) |
+| VRING0 / VRING1 (4K aligned, 256 descs), buffers | `+0x0` / `+0x4000`, buffers from `+0x8000` | `zephyr_app/src/rsc_table.c`, `linux_app/am64_rpmsg_userspace.c` (`SHM_BUF_OFFSET`) |
+| APU IPI channel 7 (Linux side, UIO) | `0xFF340000`, bit 24, SPI 29 | `linux_app/am64_rpmsg_overlay.dts`, `zephyr_app/app.overlay` (`xlnx,ipi-id = <24>`) |
+| RPU0 IPI channel 1 (Zephyr side) | `0xFF310000`, bit 8 (`0x100`), SPI 33 | `zephyr_app/app.overlay`, `linux_app/am64_rpmsg_userspace.c` (`IPI_RPU0_MASK`) |
 
-- **Renode platform** ([am64_zynqmp.repl](am64_zynqmp.repl)): extends Renode's stock `platforms/cpus/zynqmp.repl` with the shared SRAM, the resource-table RAM and the mailbox peripheral.
-- **Mailbox mock** ([ti_mailbox_mock.py](ti_mailbox_mock.py)): a Renode `PythonPeripheral` script, not a normal Python module. It uses Renode's `request`/`self` globals. Writing TX (offset `0x0`) raises the R5F IRQ. Reading or writing RX (`0x4`) clears it.
-- **Simulation script** ([run_poc.resc](run_poc.resc)): boots Antmicro's prebuilt ZynqMP Linux kernel and rootfs (downloaded from URLs) with bootargs `uio_pdrv_genirq.of_id="generic-uio"` so UIO binds to the overlay nodes.
-- **Linux side**: [am64_rpmsg_overlay.dts](am64_rpmsg_overlay.dts) exposes the SRAM and mailbox as `generic-uio` nodes. [am64_rpmsg_userspace.c](am64_rpmsg_userspace.c) opens them with `metal_device_open("platform", "a5000000.uio_sram" / "2a000000.mailbox")`.
-- **Zephyr side** ([zephyr_app/](zephyr_app/)): `rsc_table.c` places the resource table in the `.resource_table` section. `app.overlay` points `zephyr,ipc_shm` at the shared SRAM and `zephyr,ipc` at `rpu0_ipi`. `prj.conf` enables the IPC service with the RPMsg backend (remote mode) and `XLNX_IPI`.
-
-## Known gaps (as of the initial scaffolding)
-
-The POC is not wired end to end yet. Check these before assuming something works:
-- `am64_rpmsg_userspace.c` skips the vring/remoteproc setup and calls `ns_bind_cb(NULL, ...)` directly, so `rpmsg_create_ept` gets a NULL `rdev`.
-- Zephyr `main.c` never initializes IPC or OpenAMP. It only sleeps, so `endpoint_cb` is never registered.
-- The build targets the `qemu_cortex_r5` board, but `app.overlay` refers to `rpu0_ipi`, a ZynqMP node.
-- `run_poc.resc` doesn't load the Zephyr ELF onto `rpu0`, the DT overlay/DTB, or the userspace binary yet (the spec asks for all three). Its `reset` macro is a placeholder.
+- **Renode platform** ([renode/am64_zynqmp.repl](renode/am64_zynqmp.repl)): Renode's stock `platforms/cpus/zynqmp.repl` plus three `MappedMemory` regions (R5F RAM, resource table, shared SRAM). The IPI is the stock `sysbus.ipi`.
+- **Simulation script** ([renode/run_poc.resc](renode/run_poc.resc)): follows Antmicro's `scripts/single-node/zynqmp_openamp.resc` (ATF, U-Boot and Linux 6.6.10 Image, downloaded from dl.antmicro.com). It adds our DTB and rootfs and loads the Zephyr ELF on `rpu0`. Linux console is uart1, Zephyr console is uart0. It also installs a `SetHookBeforePeripheralWrite` hook on `ipi`. Renode's `ZynqMP_IPI` doesn't implement write-1-to-clear on ISR registers, and Zephyr's driver writes `0xFFFFFFFF` to ISR at init, which without the hook causes an interrupt storm on the first kick. Keep the hook.
+- **Handshake**: Zephyr copies its resource table to `0xA0100000` at boot (nothing loads it through remoteproc, so the table isn't read from the ELF) and polls the vdev status. The Linux app waits for the table, creates the vdev as `VIRTIO_DEV_DRIVER` (sets `DRIVER_OK`), and waits for the name-service announcement of `rpmsg-client-sample`. It then binds an endpoint, sends `ping`, and waits for `pong`. Each side kicks the other through the IPI and processes all vrings (`RSC_NOTIFY_ID_ANY`) on each kick.
+- **Linux side**: the overlay disables the kernel's `zynqmp_ipi1` mailbox and `rf5ss` remoteproc nodes (they would claim IPI channel 7) and uart0, and adds `generic-uio` nodes. libmetal opens them as `a0100000.rsc_table`, `a5000000.shm` and `ff340000.ipi`. The rootfs ships `uio_pdrv_genirq.ko` matching the kernel. The base DTB/rootfs URLs are pinned in `build_and_run.sh`. Antmicro has republished these files under new hashes before, so recheck the URLs if a download 404s.
+- **Zephyr side**: `qemu_cortex_r5` is the ZynqMP RPU board. `app.overlay` moves SRAM to `0xA0000000` and declares the IPI with the generic `xlnx,mbox-versal-ipi-mailbox` MBOX driver (its register layout matches ZynqMP). It uses bufferless signalling only. `main.c` uses raw OpenAMP (`VIRTIO_DEV_DEVICE`), not the IPC service, and `rsc_table.c` holds the resource table (fixed vring addresses, `VIRTIO_RPMSG_F_NS`).
+- The Zephyr module ships open-amp `v2026.04`, while the A53 app links `v2024.05.0`. The wire format (resource table, vrings, RPMsg header) is compatible between them.

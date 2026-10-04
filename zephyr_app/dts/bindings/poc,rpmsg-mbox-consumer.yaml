@@ -1,0 +1,14 @@
+description: |
+  Mailbox channels the POC firmware uses to kick and receive kicks from the A53.
+  Expects "tx" and "rx" entries in mboxes/mbox-names.
+
+compatible: "poc,rpmsg-mbox-consumer"
+
+include: base.yaml
+
+properties:
+  mboxes:
+    required: true
+
+  mbox-names:
+    required: true

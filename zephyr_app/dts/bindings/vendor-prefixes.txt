@@ -1,0 +1,1 @@
+poc	AM64x RPMsg proof of concept (application-local bindings)
