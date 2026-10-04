@@ -1,0 +1,47 @@
+/*
+ * Applied with fdtoverlay on top of Antmicro's ZynqMP OpenAMP DTB
+ * (zynqmp--sm-k26-revA-openamp.dtb) to expose the RPMsg resources to Linux
+ * userspace through UIO. Must agree with renode/am64_zynqmp.repl and
+ * zephyr_app/app.overlay.
+ */
+/dts-v1/;
+/plugin/;
+
+/*
+ * Hand the APU <-> RPU0 IPI channel (IPI channel 7) to userspace: keep the
+ * kernel mailbox and remoteproc drivers off it.
+ */
+&{/zynqmp_ipi1} {
+	status = "disabled";
+};
+
+&{/rf5ss@ff9a0000} {
+	status = "disabled";
+};
+
+/* uart0 is the R5F (Zephyr) console */
+&uart0 {
+	status = "disabled";
+};
+
+&{/} {
+	/* Resource table published by the R5F */
+	rsc_table@a0100000 {
+		compatible = "generic-uio";
+		reg = <0x0 0xa0100000 0x0 0x1000>;
+	};
+
+	/* Shared SRAM: VRING0 @ +0x0, VRING1 @ +0x4000, RPMsg buffers from +0x8000 */
+	shm@a5000000 {
+		compatible = "generic-uio";
+		reg = <0x0 0xa5000000 0x0 0x100000>;
+	};
+
+	/* APU IPI channel 7 registers; its interrupt fires when the R5F kicks us */
+	ipi@ff340000 {
+		compatible = "generic-uio";
+		reg = <0x0 0xff340000 0x0 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <0 29 4>;
+	};
+};

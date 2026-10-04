@@ -1,0 +1,62 @@
+/*
+ * R5F memory map for the AM64x RPMsg POC on the Renode ZynqMP stand-in.
+ * Must agree with renode/am64_zynqmp.repl and linux_app/am64_rpmsg_overlay.dts.
+ */
+
+/* Run from dedicated RAM outside the DDR that Linux owns */
+/delete-node/ &sram0;
+
+/ {
+	chosen {
+		zephyr,sram = &r5_ram;
+		zephyr,ipc_shm = &ipc_shm;
+		zephyr,ipc_rsc_table = &rsc_table;
+	};
+
+	r5_ram: memory@a0000000 {
+		compatible = "mmio-sram";
+		reg = <0xa0000000 DT_SIZE_M(1)>;
+	};
+
+	rsc_table: memory@a0100000 {
+		compatible = "mmio-sram";
+		reg = <0xa0100000 0x1000>;
+	};
+
+	/* VRING0 @ +0x0, VRING1 @ +0x4000, RPMsg buffers from +0x8000 */
+	ipc_shm: memory@a5000000 {
+		compatible = "mmio-sram";
+		reg = <0xa5000000 DT_SIZE_M(1)>;
+	};
+
+	rpmsg_mbox: rpmsg-mbox {
+		compatible = "poc,rpmsg-mbox-consumer";
+		mboxes = <&ipi_apu 0>, <&ipi_apu 1>;
+		mbox-names = "tx", "rx";
+	};
+};
+
+/*
+ * ZynqMP IPI used as the AM64x mailbox stand-in: RPU0 owns IPI channel 1
+ * (bit 8, SPI 33) and talks to the APU on IPI channel 7 (bit 24), which Linux
+ * userspace drives through UIO.
+ */
+&{/soc} {
+	rpu0_ipi_mbox: mailbox@ff310000 {
+		compatible = "xlnx,mbox-versal-ipi-mailbox";
+		reg = <0xff310000 0x1000>;
+		reg-names = "ctrl";
+		interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL IRQ_DEFAULT_PRIORITY>;
+		xlnx,ipi-id = <8>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ipi_apu: mailbox@ff340000 {
+			compatible = "xlnx,mbox-versal-ipi-dest-mailbox";
+			reg = <0xff340000 0x1000>;
+			reg-names = "ctrl";
+			xlnx,ipi-id = <24>;
+			#mbox-cells = <1>;
+		};
+	};
+};
