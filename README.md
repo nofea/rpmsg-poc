@@ -66,8 +66,12 @@ docker run --rm -it -p 3456:3456 -v "$PWD":/workspace rpmsg-poc ./scripts/build_
 The Renode monitor runs in that terminal, and its log shows both UARTs: `uart1` is Linux and `uart0` is Zephyr. The Linux console is also served on TCP port 3456. Once the log shows `Machine started`, connect to it from a second terminal:
 
 ```bash
-telnet localhost 3456        # or: nc localhost 3456
+telnet 127.0.0.1 3456        # or: nc 127.0.0.1 3456
 ```
+
+Use `127.0.0.1` rather than `localhost`. With rootless Podman, `localhost` can resolve to `::1`, where the connection is accepted and then dropped or reset.
+
+The console only serves one client at a time and doesn't replay earlier output, so press **Enter** after connecting to get the `buildroot login:` prompt. If a connection is dropped, close it before reconnecting. Type everything below into this telnet/nc session, not into the Renode monitor (the `(AM64x_RPMsg_POC)` prompt), which doesn't know Linux commands.
 
 At `buildroot login:`, log in as `root` (no password) and run:
 

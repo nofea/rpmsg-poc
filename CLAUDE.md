@@ -24,7 +24,7 @@ Everything runs inside the image built from [Dockerfile](Dockerfile). It is base
 ```bash
 docker build -t rpmsg-poc .
 docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh              # build + acceptance test
-docker run --rm -it -p 3456:3456 -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh interactive  # Linux console on telnet localhost 3456
+docker run --rm -it -p 3456:3456 -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh interactive  # Linux console on telnet 127.0.0.1 3456
 docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh build        # build only
 ```
 
