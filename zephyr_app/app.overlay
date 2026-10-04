@@ -1,0 +1,22 @@
+/ {
+	chosen {
+		zephyr,ipc_shm = &shm0;
+		zephyr,ipc = &rpu0_ipi;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		shm0: memory@a5000000 {
+			compatible = "shared-dma-pool";
+			reg = <0xa5000000 0x100000>;
+			no-map;
+		};
+	};
+};
+
+&rpu0_ipi {
+	status = "okay";
+};

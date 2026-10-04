@@ -1,0 +1,17 @@
+using "platforms/cpus/zynqmp.repl"
+
+// Shared SRAM for OpenAMP
+shared_sram: Memory.MappedMemory @ sysbus 0xA5000000
+    size: 0x100000
+
+// Resource table memory for R5F
+rsc_table: Memory.MappedMemory @ sysbus 0xA0100000
+    size: 0x1000
+
+// Mock Mailbox (TI AM64x style)
+ti_mailbox: Python.PythonPeripheral @ sysbus 0x2A000000
+    size: 0x100
+    initable: true
+    script: "ti_mailbox_mock.py"
+    // Connect to an arbitrary RPU IRQ (assuming rpu0 is defined in zynqmp.repl)
+    -> rpu0@100
