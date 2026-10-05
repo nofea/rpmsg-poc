@@ -4,9 +4,17 @@
  * the IPI registers through UIO (see am64_rpmsg_overlay.dts).
  *
  * Flow: wait for the R5F to publish its resource table, initialize the vrings
- * and buffers (sets DRIVER_OK), wait for the R5F's name service announcement,
- * send "ping" and wait for the reply.
+ * and buffers (sets DRIVER_OK), wait for the R5F's name service announcement
+ * and send a zero-length message so the R5F learns our endpoint address. Then:
+ *
+ *   am64_rpmsg_userspace <msg> [<msg> ...]   send each argument as a message,
+ *                                            print replies until idle for 2 s
+ *   am64_rpmsg_userspace                     interactive: send each stdin line,
+ *                                            print incoming messages, exit on
+ *                                            "quit" or EOF
  */
+#include <errno.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,10 +44,15 @@
 #define SHM_BUF_OFFSET 0x8000
 
 #define RPMSG_SERVICE_NAME "rpmsg-client-sample"
-#define MSG                "ping"
+
+/* 512-byte RPMsg buffer minus the 16-byte RPMsg header */
+#define MAX_PAYLOAD 496
 
 #define RSC_TABLE_TIMEOUT_S 30
-#define REPLY_TIMEOUT_S     60
+#define NS_TIMEOUT_S        60
+#define CLI_IDLE_MS         2000
+#define POLL_INTERVAL_MS    1
+#define LINE_BUF_SIZE       1024
 
 #define LOG(fmt, ...) printf("am64_rpmsg_userspace: " fmt "\n", ##__VA_ARGS__)
 
@@ -56,7 +69,7 @@ static struct rpmsg_virtio_device rvdev;
 static struct rpmsg_virtio_shm_pool shpool;
 static struct rpmsg_endpoint ept;
 static int ept_bound;
-static int reply_received;
+static long last_activity_ms;
 
 static int ipi_irq_handler(int vector, void *priv)
 {
@@ -94,6 +107,14 @@ static const struct remoteproc_ops rproc_ops = {
 	.notify = rproc_notify,
 };
 
+static long now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
 		       uint32_t src, void *priv)
 {
@@ -101,7 +122,7 @@ static int endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
 	(void)src;
 	(void)priv;
 	LOG("received \"%.*s\"", (int)len, (char *)data);
-	reply_received = 1;
+	last_activity_ms = now_ms();
 	return RPMSG_SUCCESS;
 }
 
@@ -159,30 +180,132 @@ static int wait_for_rsc_table(void)
 	return -1;
 }
 
-/* Wait for a kick from the R5F and let OpenAMP process the vrings */
-static void poll_notifications(void)
+/*
+ * Wait up to POLL_INTERVAL_MS for input on fd (none if fd < 0), and let OpenAMP
+ * process the vrings if the R5F kicked us. Returns nonzero if fd is readable.
+ */
+static int wait_for_events(int fd)
 {
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	int ready = 0;
+
+	if (fd >= 0)
+		ready = poll(&pfd, 1, POLL_INTERVAL_MS) > 0;
+	else
+		usleep(POLL_INTERVAL_MS * 1000);
+
 	if (atomic_exchange(&plat.kicked, 0))
 		remoteproc_get_notification(&rproc, RSC_NOTIFY_ID_ANY);
-	else
-		usleep(1000);
+	return ready;
 }
 
-static time_t now(void)
+static int send_msg(const char *text, size_t len)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec;
+	/* Zero-length messages are reserved for the connect notification */
+	if (len == 0) {
+		LOG("empty messages can't be sent");
+		return -1;
+	}
+	if (len > MAX_PAYLOAD) {
+		LOG("message too long (%zu bytes, max %d)", len, MAX_PAYLOAD);
+		return -1;
+	}
+	if (rpmsg_send(&ept, text, len) < 0) {
+		LOG("rpmsg_send failed");
+		return -1;
+	}
+	LOG("sent \"%.*s\"", (int)len, text);
+	last_activity_ms = now_ms();
+	return 0;
 }
 
-int main(void)
+/* Send each argument, then print incoming messages until idle for CLI_IDLE_MS */
+static int run_cli(int argc, char **argv)
+{
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		if (send_msg(argv[i], strlen(argv[i])))
+			return -1;
+	}
+
+	while (now_ms() - last_activity_ms < CLI_IDLE_MS)
+		wait_for_events(-1);
+	return 0;
+}
+
+/* Returns 1 on "quit", 0 otherwise */
+static int handle_line(const char *line, size_t len)
+{
+	if (len && line[len - 1] == '\r')
+		len--;
+	if (len == 0)
+		return 0;
+	if (len == 4 && !memcmp(line, "quit", 4))
+		return 1;
+
+	send_msg(line, len);
+	return 0;
+}
+
+/* Send each stdin line, print incoming messages as they arrive */
+static int run_interactive(void)
+{
+	char buf[LINE_BUF_SIZE];
+	size_t used = 0;
+	int discarding = 0;
+
+	LOG("interactive mode: type a message and press Enter, \"quit\" or Ctrl-D to exit");
+	for (;;) {
+		char *start = buf, *nl;
+		ssize_t n;
+
+		if (!wait_for_events(STDIN_FILENO))
+			continue;
+
+		n = read(STDIN_FILENO, buf + used, sizeof(buf) - used);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			LOG("failed to read stdin: %s", strerror(errno));
+			return -1;
+		}
+		if (n == 0) {
+			/* EOF: send an unterminated last line, if any */
+			if (used && !discarding)
+				handle_line(buf, used);
+			return 0;
+		}
+		used += n;
+
+		while ((nl = memchr(start, '\n', buf + used - start))) {
+			if (!discarding && handle_line(start, nl - start))
+				return 0;
+			discarding = 0;
+			start = nl + 1;
+		}
+		used -= start - buf;
+		memmove(buf, start, used);
+
+		/* No newline in a full buffer: drop the rest of this line */
+		if (used == sizeof(buf)) {
+			LOG("message too long (max %d bytes)", MAX_PAYLOAD);
+			discarding = 1;
+			used = 0;
+		}
+	}
+}
+
+int main(int argc, char **argv)
 {
 	struct metal_init_params metal_param = METAL_INIT_DEFAULTS;
 	struct resource_table *rsc;
 	struct virtio_device *vdev;
 	int irq = -1, ret = 1;
-	time_t deadline;
+	long deadline;
+
+	/* Keep received messages visible when stdout isn't a terminal */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	LOG("initializing OpenAMP over UIO");
 	if (metal_init(&metal_param)) {
@@ -233,26 +356,23 @@ int main(void)
 	}
 	LOG("vrings ready, waiting for the R5F to announce \"%s\"", RPMSG_SERVICE_NAME);
 
-	deadline = now() + REPLY_TIMEOUT_S;
-	while (!ept_bound && now() < deadline)
-		poll_notifications();
+	deadline = now_ms() + NS_TIMEOUT_S * 1000L;
+	while (!ept_bound && now_ms() < deadline)
+		wait_for_events(-1);
 	if (!ept_bound) {
 		LOG("timed out waiting for the name service announcement");
 		goto out_vdev;
 	}
 
-	if (rpmsg_send(&ept, MSG, strlen(MSG)) < 0) {
-		LOG("rpmsg_send failed");
+	/* We bound straight to the R5F's address; tell it ours */
+	if (rpmsg_send(&ept, "", 0) < 0) {
+		LOG("failed to send the connect message");
 		goto out_ept;
 	}
-	LOG("sent \"%s\"", MSG);
+	LOG("connected to \"%s\"", RPMSG_SERVICE_NAME);
 
-	while (!reply_received && now() < deadline)
-		poll_notifications();
-	if (!reply_received) {
-		LOG("timed out waiting for the reply");
+	if ((argc > 1 ? run_cli(argc, argv) : run_interactive()))
 		goto out_ept;
-	}
 
 	LOG("done");
 	ret = 0;
