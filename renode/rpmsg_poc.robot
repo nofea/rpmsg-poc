@@ -80,10 +80,16 @@ Should Transfer Bulk Payloads In Both Directions
     Wait For Line On Uart       OpenAMP: Received bulk 1: 1048576 bytes, crc 0x[0-9a-f]{8} OK    testerId=${zephyr}  timeout=120  treatAsRegex=true
     Wait For Line On Uart       am64_rpmsg_userspace: bulk 1 released               testerId=${linux}   timeout=60
 
+    # The payload can be viewed in place on the R5F
+    Write Line To Uart          rpmsg dump 32               testerId=${zephyr}
+    Wait For Line On Uart       OpenAMP: bulk 1, bytes 0..31 of 1048576:            testerId=${zephyr}  timeout=60
+    Wait For Line On Uart       00000010:                   testerId=${zephyr}  timeout=60
+
     # Zephyr -> Linux: 2 MB test pattern
     Write Line To Uart          rpmsg bulk 2M               testerId=${zephyr}
     Wait For Line On Uart       OpenAMP: Sent bulk 1: 2097152 bytes                 testerId=${zephyr}  timeout=120
     Wait For Line On Uart       am64_rpmsg_userspace: received bulk 1: 2097152 bytes, crc 0x[0-9a-f]{8} OK    testerId=${linux}   timeout=120  treatAsRegex=true
+    Wait For Line On Uart       am64_rpmsg_userspace: saved bulk 1 to /tmp/bulk_1.bin    testerId=${linux}   timeout=60
     Wait For Line On Uart       OpenAMP: bulk 1 released                            testerId=${zephyr}  timeout=60
 
     # Text messages still work alongside
@@ -92,3 +98,8 @@ Should Transfer Bulk Payloads In Both Directions
 
     Write Line To Uart          quit                        testerId=${linux}
     Wait For Line On Uart       am64_rpmsg_userspace: done                          testerId=${linux}   timeout=60
+
+    # The saved file holds Zephyr's pattern: byte i = i * 31 + id
+    Wait For Prompt On Uart     ${LINUX_PROMPT}             testerId=${linux}   timeout=60
+    Write Line To Uart          head -c 16 /tmp/bulk_1.bin | hexdump -C    testerId=${linux}
+    Wait For Line On Uart       00000000${SPACE}${SPACE}01 20 3f 5e 7d 9c bb da${SPACE}${SPACE}f9 18 37 56 75 94 b3 d2   testerId=${linux}   timeout=60

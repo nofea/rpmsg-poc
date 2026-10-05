@@ -55,6 +55,13 @@ static atomic_t a53_bulk_connected;
 static atomic_t bulk_in_flight;
 static uint32_t bulk_next_id = 1;
 
+/*
+ * Last payload received from the A53, for "rpmsg dump". It stays in the A53's
+ * area until the A53 sends its next bulk payload.
+ */
+static struct k_spinlock bulk_rx_lock;
+static struct rpmsg_bulk_msg bulk_rx_last;
+
 static void mbox_rx_callback(const struct device *dev, mbox_channel_id_t channel_id,
 			     void *user_data, struct mbox_msg *data)
 {
@@ -180,6 +187,9 @@ static int bulk_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len, 
 		crc = crc32_ieee(bulk_region + msg.offset, msg.len);
 		printk("OpenAMP: Received bulk %u: %u bytes, crc 0x%08x %s\n", msg.id, msg.len,
 		       crc, crc == msg.crc32 ? "OK" : "MISMATCH");
+		K_SPINLOCK(&bulk_rx_lock) {
+			bulk_rx_last = msg;
+		}
 		if (bulk_send_ctrl(RPMSG_BULK_RELEASE, msg.id, 0, 0, 0) < 0) {
 			printk("OpenAMP: failed to release bulk %u\n", msg.id);
 		}
@@ -264,12 +274,52 @@ static int cmd_rpmsg_bulk(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/*
+ * rpmsg dump [len] [offset]: hexdump the last payload received from the A53,
+ * in place in the bulk region. Defaults to the first 256 bytes.
+ */
+static int cmd_rpmsg_dump(const struct shell *sh, size_t argc, char **argv)
+{
+	struct rpmsg_bulk_msg last;
+	size_t len = 256, offset = 0;
+
+	K_SPINLOCK(&bulk_rx_lock) {
+		last = bulk_rx_last;
+	}
+	if (last.len == 0) {
+		shell_error(sh, "OpenAMP: no bulk payload received yet");
+		return -ENODATA;
+	}
+	if ((argc > 1 && parse_size(argv[1], &len)) ||
+	    (argc > 2 && parse_size(argv[2], &offset))) {
+		shell_error(sh, "OpenAMP: usage: rpmsg dump [len] [offset] (K/M suffixes allowed)");
+		return -EINVAL;
+	}
+	if (offset >= last.len) {
+		shell_error(sh, "OpenAMP: offset beyond the %u-byte payload", last.len);
+		return -EINVAL;
+	}
+	len = MIN(len, last.len - offset);
+
+	shell_print(sh, "OpenAMP: bulk %u, bytes %u..%u of %u:", last.id, (unsigned int)offset,
+		    (unsigned int)(offset + len - 1), last.len);
+	for (size_t i = 0; i < len; i += SHELL_HEXDUMP_BYTES_IN_LINE) {
+		shell_hexdump_line(sh, offset + i, bulk_region + last.offset + offset + i,
+				   MIN(len - i, SHELL_HEXDUMP_BYTES_IN_LINE));
+	}
+
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_rpmsg,
 	SHELL_CMD_ARG(send, NULL, "Send a text message to the A53: rpmsg send <text...>",
 		      cmd_rpmsg_send, 2, SHELL_OPT_ARG_CHECK_SKIP),
 	SHELL_CMD_ARG(bulk, NULL,
 		      "Send a test pattern through the bulk region: rpmsg bulk <bytes>[K|M]",
 		      cmd_rpmsg_bulk, 2, 0),
+	SHELL_CMD_ARG(dump, NULL,
+		      "Hexdump the last bulk payload from the A53: rpmsg dump [len] [offset]",
+		      cmd_rpmsg_dump, 1, 2),
 	SHELL_SUBCMD_SET_END);
 SHELL_CMD_REGISTER(rpmsg, &sub_rpmsg, "RPMsg commands", NULL);
 

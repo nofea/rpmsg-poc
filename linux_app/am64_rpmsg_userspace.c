@@ -18,6 +18,8 @@
  *                                            ("/bulk <file>" sends a file as a
  *                                            bulk payload), print incoming
  *                                            messages, exit on "quit" or EOF
+ *
+ * Bulk payloads received from the R5F are saved to /tmp/bulk_<id>.bin.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -64,6 +66,7 @@
 #define LINE_BUF_SIZE       1024
 #define BULK_RELEASE_TIMEOUT_S 60
 #define BULK_CHUNK_SIZE     65536
+#define BULK_SAVE_FMT       "/tmp/bulk_%u.bin"
 
 #define LOG(fmt, ...) printf("am64_rpmsg_userspace: " fmt "\n", ##__VA_ARGS__)
 
@@ -174,10 +177,12 @@ static int bulk_send_ctrl(uint32_t type, uint32_t id, uint32_t offset, uint32_t 
 }
 
 /*
- * The bulk region is mapped uncached (device memory), so it is only accessed
- * through metal_io_block_read/write, which keep the accesses aligned.
+ * Compute the CRC of a payload in the bulk region and, if fd >= 0, copy it to
+ * fd. Clears *fd on a write error. The bulk region is mapped uncached (device
+ * memory), so it is only accessed through metal_io_block_read/write, which
+ * keep the accesses aligned.
  */
-static uint32_t bulk_crc(unsigned long offset, size_t len)
+static uint32_t bulk_read(unsigned long offset, size_t len, int *fd)
 {
 	static uint8_t chunk[BULK_CHUNK_SIZE];
 	uint32_t crc = 0;
@@ -187,6 +192,11 @@ static uint32_t bulk_crc(unsigned long offset, size_t len)
 
 		metal_io_block_read(plat.bulk_io, offset, chunk, n);
 		crc = crc32_update(crc, chunk, n);
+		if (*fd >= 0 && write(*fd, chunk, n) != (ssize_t)n) {
+			LOG("failed to save bulk payload: %s", strerror(errno));
+			close(*fd);
+			*fd = -1;
+		}
 		offset += n;
 		len -= n;
 	}
@@ -198,7 +208,9 @@ static int bulk_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
 			    uint32_t src, void *priv)
 {
 	struct rpmsg_bulk_msg msg;
+	char path[64];
 	uint32_t crc;
+	int fd;
 
 	(void)ept;
 	(void)src;
@@ -218,9 +230,17 @@ static int bulk_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
 			    msg.id, msg.offset, msg.len);
 			return RPMSG_SUCCESS;
 		}
-		crc = bulk_crc(msg.offset, msg.len);
+		snprintf(path, sizeof(path), BULK_SAVE_FMT, msg.id);
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (fd < 0)
+			LOG("failed to create %s: %s", path, strerror(errno));
+		crc = bulk_read(msg.offset, msg.len, &fd);
 		LOG("received bulk %u: %u bytes, crc 0x%08x %s", msg.id, msg.len, crc,
 		    crc == msg.crc32 ? "OK" : "MISMATCH");
+		if (fd >= 0) {
+			close(fd);
+			LOG("saved bulk %u to %s", msg.id, path);
+		}
 		if (bulk_send_ctrl(RPMSG_BULK_RELEASE, msg.id, 0, 0, 0) < 0)
 			LOG("failed to release bulk %u", msg.id);
 		break;
