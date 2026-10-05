@@ -15,6 +15,7 @@ The design spec is [docs/agent_spec_am64x_rpmsg_poc.md](docs/agent_spec_am64x_rp
 2. Linux boots on the A53. The userspace app `am64_rpmsg_userspace` maps the resource table, the shared SRAM and the IPI registers through UIO. It sets up the vrings and buffers and signals the R5F that they're ready.
 3. Zephyr announces the `rpmsg-client-sample` endpoint. The app binds to it and sends a zero-length message, which tells Zephyr the app's endpoint address.
 4. Text messages can then go both ways. Zephyr answers `"ping"` with `"pong"` and only logs every other message.
+5. Zephyr also announces a second endpoint, `rpmsg-bulk`, for payloads too large for an RPMsg message (see [Bulk transfers](#bulk-transfers)).
 
 Expected console output for `am64_rpmsg_userspace ping`:
 
@@ -36,6 +37,45 @@ Messages are plain text, up to 496 bytes each.
 - **Linux to Zephyr, interactive mode:** `am64_rpmsg_userspace` with no arguments sends each line you type and prints incoming messages as they arrive. Exit with `quit` or Ctrl-D.
 - **Zephyr to Linux:** the Zephyr shell runs on uart0. `rpmsg send <text...>` sends the text to the app. It only works while the app is running, because Zephyr learns the app's address from its connect message.
 
+### Bulk transfers
+
+RPMsg messages are limited to 496 bytes, so larger payloads, up to 8 MB, go through a dedicated 16 MB shared-memory region. Only a small descriptor (id, offset, length, CRC32) travels over RPMsg. The receiver checks the CRC on the data in place and sends a release back, after which the sender can reuse its area. Each direction allows one transfer in flight at a time.
+
+| Where | Command | What it does |
+|---|---|---|
+| Linux, CLI mode | `am64_rpmsg_userspace --bulk <file>` | Sends a file. It can be mixed with text arguments, e.g. `am64_rpmsg_userspace hi --bulk /tmp/blob ping`. The app waits for the release before moving on. |
+| Linux, interactive mode | `/bulk <file>` | Sends a file. Every other line is still sent as a text message. |
+| Zephyr shell | `rpmsg bulk <size>[K\|M]` | Sends a generated test pattern (byte `i` is `i * 31 + id`), since Zephyr has no files. |
+| Zephyr shell | `rpmsg dump [len] [offset]` | Hexdumps the last payload received from Linux, read in place from shared memory. Shows the first 256 bytes by default; `K`/`M` suffixes work here too. |
+
+Viewing what was received:
+
+- **On Linux**, each payload from Zephyr is saved to `/tmp/bulk_<id>.bin` and the app logs `saved bulk <id> to /tmp/bulk_<id>.bin`. The app holds the console while it runs, so look at the file after `quit`, for example `hexdump -C /tmp/bulk_1.bin | head`. Ids start at 1 on every boot, so the next boot overwrites the files (the rootfs is a RAM disk anyway).
+- **On Zephyr**, `rpmsg dump` reads the payload where Linux wrote it. That data stays valid until Linux sends its next bulk payload, which overwrites the same area.
+
+Example session (1 MB from Linux, 2 MB from Zephyr):
+
+```
+# Linux (uart1)
+dd if=/dev/urandom of=/tmp/blob bs=1M count=1
+/root/am64_rpmsg_userspace
+/bulk /tmp/blob
+am64_rpmsg_userspace: sent bulk 1: 1048576 bytes, crc 0x…
+am64_rpmsg_userspace: bulk 1 released
+
+# Zephyr (uart0)
+OpenAMP: Received bulk 1: 1048576 bytes, crc 0x… OK
+uart:~$ rpmsg dump 32
+OpenAMP: bulk 1, bytes 0..31 of 1048576:
+00000000: …
+uart:~$ rpmsg bulk 2M
+OpenAMP: Sent bulk 1: 2097152 bytes, crc 0x…
+
+# Linux (uart1)
+am64_rpmsg_userspace: received bulk 1: 2097152 bytes, crc 0x… OK
+am64_rpmsg_userspace: saved bulk 1 to /tmp/bulk_1.bin
+```
+
 ## Requirements
 
 - Docker or Podman
@@ -53,7 +93,7 @@ docker run --rm -it -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh
 
 With Podman, use `podman` in place of `docker`. On SELinux hosts, add `:Z` to the volume (`-v "$PWD":/workspace:Z`).
 
-This builds everything and runs the automated acceptance test ([renode/rpmsg_poc.robot](renode/rpmsg_poc.robot)). The first run takes a while because it fetches the Zephyr workspace. After that, the test itself takes under a minute. Results land in `build/test-results/` (`log.html` has the full UART transcripts).
+This builds everything and runs the automated acceptance test ([renode/rpmsg_poc.robot](renode/rpmsg_poc.robot)). The first run takes a while because it fetches the Zephyr workspace. After that, the test itself (three test cases: ping/pong, custom messages and bulk transfers) takes about two minutes. Results land in `build/test-results/` (`log.html` has the full UART transcripts).
 
 ### Modes
 
@@ -86,6 +126,7 @@ At `buildroot login:`, log in as `root` (no password) and run:
 ```sh
 /root/am64_rpmsg_userspace          # interactive session
 /root/am64_rpmsg_userspace ping     # or: one-shot, prints "pong"
+/root/am64_rpmsg_userspace --bulk /tmp/blob   # or: one-shot bulk transfer of a file
 ```
 
 The Zephyr side of the exchange appears as `uart0` lines in the Renode log. Type `quit` in the Renode monitor to exit.
@@ -93,7 +134,7 @@ The Zephyr side of the exchange appears as `uart0` lines in the Renode log. Type
 Notes:
 - Type commands rather than pasting them. The simulated UART drops characters when a whole line arrives in one burst.
 - The app does one session per simulation boot (one CLI run or one interactive session), so restart the simulation to run it again.
-- The Zephyr shell (`uart0`) is served on TCP port 3457. Connect with `telnet 127.0.0.1 3457`, press **Enter** to get the `uart:~$` prompt, and type `rpmsg send <text>` while the app is running.
+- The Zephyr shell (`uart0`) is served on TCP port 3457. Connect with `telnet 127.0.0.1 3457`, press **Enter** to get the `uart:~$` prompt, and type `rpmsg send <text>`, `rpmsg bulk <size>` or `rpmsg dump` while the app is running.
 
 ## How it is built
 
@@ -113,6 +154,7 @@ Notes:
 | R5F (Zephyr) RAM, 1 MB | `0xA0000000` |
 | Resource table, 4 KB | `0xA0100000` |
 | Shared SRAM, 1 MB (VRING0 at `+0x0`, VRING1 at `+0x4000`, buffers from `+0x8000`) | `0xA5000000` |
+| Bulk region, 16 MB (Linux→Zephyr area at `+0x0`, Zephyr→Linux area at `+0x800000`, 8 MB each) | `0xA8000000` |
 | A53 IPI channel 7 (UIO on Linux) | `0xFF340000`, SPI 29 |
 | R5F IPI channel 1 | `0xFF310000`, SPI 33 |
 
@@ -121,6 +163,7 @@ These values are spread across the Renode platform, both device trees and both a
 ## Repository layout
 
 ```
+common/      rpmsg_bulk.h, the bulk transfer protocol shared by both apps
 docs/        design spec
 linux_app/   A53 userspace RPMsg host and Linux device tree overlay
 zephyr_app/  R5F Zephyr firmware (OpenAMP remote, resource table, IPI mailbox)
@@ -135,5 +178,6 @@ Dockerfile   build/run environment
 - **No remoteproc loading.** Renode loads the R5F firmware directly, and Zephyr copies its resource table to a fixed address that Linux maps.
 - **One session per boot.** The Zephyr side doesn't handle a virtio reset.
 - **Zephyr sends after the app exits are lost.** Zephyr keeps the app's address, so `rpmsg send` still fills vring buffers that nobody reads. Once the buffers run out, it times out with an error.
+- **Caches on real hardware.** Renode doesn't model caches. On a real AM64x, the R5F's MPU has to map the bulk region non-cacheable, or the firmware has to flush and invalidate around transfers. Linux already maps it uncached through UIO.
 - **Renode IPI quirk.** `renode/run_poc.resc` installs a hook because Renode's `ZynqMP_IPI` model doesn't implement write-1-to-clear on its status registers. Without it, the R5F gets stuck in an interrupt storm.
 - **External images.** The Linux kernel, firmware and rootfs are Antmicro's prebuilt ZynqMP OpenAMP demo images, downloaded from `dl.antmicro.com`.

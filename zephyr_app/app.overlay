@@ -29,6 +29,12 @@
 		reg = <0xa5000000 DT_SIZE_M(1)>;
 	};
 
+	/* Bulk payloads: A53->R5F area @ +0x0, R5F->A53 area @ +0x800000 */
+	bulk_shm: memory@a8000000 {
+		compatible = "mmio-sram";
+		reg = <0xa8000000 DT_SIZE_M(16)>;
+	};
+
 	rpmsg_mbox: rpmsg-mbox {
 		compatible = "poc,rpmsg-mbox-consumer";
 		mboxes = <&ipi_apu 0>, <&ipi_apu 1>;

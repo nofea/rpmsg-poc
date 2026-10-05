@@ -37,6 +37,12 @@
 		reg = <0x0 0xa5000000 0x0 0x100000>;
 	};
 
+	/* Bulk payloads: A53->R5F area @ +0x0, R5F->A53 area @ +0x800000 */
+	bulk@a8000000 {
+		compatible = "generic-uio";
+		reg = <0x0 0xa8000000 0x0 0x1000000>;
+	};
+
 	/* APU IPI channel 7 registers; its interrupt fires when the R5F kicks us */
 	ipi@ff340000 {
 		compatible = "generic-uio";
