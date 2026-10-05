@@ -1,14 +1,18 @@
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/mbox.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/barrier.h>
+#include <zephyr/sys/crc.h>
 #include <zephyr/sys/printk.h>
 #include <openamp/open_amp.h>
 #include <metal/sys.h>
 #include <metal/io.h>
+#include "rpmsg_bulk.h"
 #include "rsc_table.h"
 
 #define RPMSG_SERVICE_NAME "rpmsg-client-sample"
@@ -21,6 +25,12 @@
 #define SHM_NODE DT_CHOSEN(zephyr_ipc_shm)
 #define SHM_ADDR DT_REG_ADDR(SHM_NODE)
 #define SHM_SIZE DT_REG_SIZE(SHM_NODE)
+
+#define BULK_NODE DT_NODELABEL(bulk_shm)
+BUILD_ASSERT(DT_REG_ADDR(BULK_NODE) == RPMSG_BULK_REGION_ADDR &&
+	     DT_REG_SIZE(BULK_NODE) == RPMSG_BULK_REGION_SIZE,
+	     "bulk_shm in app.overlay must match common/rpmsg_bulk.h");
+static uint8_t *const bulk_region = (uint8_t *)DT_REG_ADDR(BULK_NODE);
 
 /* ZynqMP IPI: RPU0 (channel 1) <-> APU (channel 7), see app.overlay */
 static const struct mbox_dt_spec mbox_tx = MBOX_DT_SPEC_GET(DT_NODELABEL(rpmsg_mbox), tx);
@@ -35,9 +45,15 @@ static struct metal_io_region rsc_io;
 
 static struct rpmsg_virtio_device rvdev;
 static struct rpmsg_endpoint ept;
+static struct rpmsg_endpoint bulk_ept;
 
 /* Set once a message from the A53 has told us its endpoint address */
 static atomic_t a53_connected;
+static atomic_t a53_bulk_connected;
+
+/* Set while our R5F->A53 area holds a payload the A53 hasn't released */
+static atomic_t bulk_in_flight;
+static uint32_t bulk_next_id = 1;
 
 static void mbox_rx_callback(const struct device *dev, mbox_channel_id_t channel_id,
 			     void *user_data, struct mbox_msg *data)
@@ -124,9 +140,136 @@ static int cmd_rpmsg_send(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int bulk_send_ctrl(uint32_t type, uint32_t id, uint32_t offset, uint32_t len,
+			  uint32_t crc)
+{
+	struct rpmsg_bulk_msg msg = {
+		.type = type, .id = id, .offset = offset, .len = len, .crc32 = crc,
+	};
+
+	return rpmsg_send(&bulk_ept, &msg, sizeof(msg));
+}
+
+/* The A53 wrote a payload into its area: check it in place, then release it */
+static int bulk_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len, uint32_t src,
+			    void *priv)
+{
+	struct rpmsg_bulk_msg msg;
+	uint32_t crc;
+
+	if (!atomic_set(&a53_bulk_connected, 1)) {
+		printk("OpenAMP: A53 bulk channel connected (addr 0x%x)\n", src);
+	}
+	if (len == 0) {
+		return RPMSG_SUCCESS;
+	}
+	if (len != sizeof(msg)) {
+		printk("OpenAMP: dropped bulk message with bad length %u\n", (unsigned int)len);
+		return RPMSG_SUCCESS;
+	}
+	memcpy(&msg, data, sizeof(msg));
+
+	switch (msg.type) {
+	case RPMSG_BULK_XFER:
+		if (msg.offset < RPMSG_BULK_A53_TX_OFFSET || msg.len > RPMSG_BULK_MAX_LEN ||
+		    msg.offset - RPMSG_BULK_A53_TX_OFFSET > RPMSG_BULK_MAX_LEN - msg.len) {
+			printk("OpenAMP: dropped bulk %u outside the A53 area (offset 0x%x, len %u)\n",
+			       msg.id, msg.offset, msg.len);
+			return RPMSG_SUCCESS;
+		}
+		crc = crc32_ieee(bulk_region + msg.offset, msg.len);
+		printk("OpenAMP: Received bulk %u: %u bytes, crc 0x%08x %s\n", msg.id, msg.len,
+		       crc, crc == msg.crc32 ? "OK" : "MISMATCH");
+		if (bulk_send_ctrl(RPMSG_BULK_RELEASE, msg.id, 0, 0, 0) < 0) {
+			printk("OpenAMP: failed to release bulk %u\n", msg.id);
+		}
+		break;
+	case RPMSG_BULK_RELEASE:
+		atomic_clear(&bulk_in_flight);
+		printk("OpenAMP: bulk %u released\n", msg.id);
+		break;
+	default:
+		printk("OpenAMP: dropped bulk message with unknown type %u\n", msg.type);
+		break;
+	}
+
+	return RPMSG_SUCCESS;
+}
+
+/* Parses <n>[K|M] */
+static int parse_size(const char *arg, size_t *size)
+{
+	char *end;
+	unsigned long n = strtoul(arg, &end, 0);
+
+	if (end == arg) {
+		return -EINVAL;
+	}
+	if (*end == 'K' || *end == 'k') {
+		n *= 1024;
+		end++;
+	} else if (*end == 'M' || *end == 'm') {
+		n *= 1024 * 1024;
+		end++;
+	}
+	if (*end != '\0') {
+		return -EINVAL;
+	}
+	*size = n;
+	return 0;
+}
+
+/*
+ * rpmsg bulk <bytes>[K|M]: fill our R5F->A53 area with a test pattern and hand
+ * it to the A53. The payload never passes through the vrings.
+ */
+static int cmd_rpmsg_bulk(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t *buf = bulk_region + RPMSG_BULK_R5F_TX_OFFSET;
+	uint32_t id, crc;
+	size_t len;
+	int ret;
+
+	if (parse_size(argv[1], &len) || len == 0 || len > RPMSG_BULK_MAX_LEN) {
+		shell_error(sh, "OpenAMP: bulk size must be 1..%u bytes (K/M suffixes allowed)",
+			    RPMSG_BULK_MAX_LEN);
+		return -EINVAL;
+	}
+	if (!atomic_get(&a53_bulk_connected)) {
+		shell_error(sh, "OpenAMP: A53 not connected, start am64_rpmsg_userspace first");
+		return -ENOTCONN;
+	}
+	if (atomic_set(&bulk_in_flight, 1)) {
+		shell_error(sh, "OpenAMP: previous bulk transfer still in flight");
+		return -EBUSY;
+	}
+
+	id = bulk_next_id++;
+	for (size_t i = 0; i < len; i++) {
+		buf[i] = (uint8_t)(i * 31 + id);
+	}
+	crc = crc32_ieee(buf, len);
+
+	/* The payload must be visible before the A53 sees the descriptor */
+	barrier_dmem_fence_full();
+	ret = bulk_send_ctrl(RPMSG_BULK_XFER, id, RPMSG_BULK_R5F_TX_OFFSET, len, crc);
+	if (ret < 0) {
+		atomic_clear(&bulk_in_flight);
+		shell_error(sh, "OpenAMP: failed to send bulk descriptor: %d", ret);
+		return -EIO;
+	}
+	shell_print(sh, "OpenAMP: Sent bulk %u: %u bytes, crc 0x%08x", id, (unsigned int)len,
+		    crc);
+
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_rpmsg,
 	SHELL_CMD_ARG(send, NULL, "Send a text message to the A53: rpmsg send <text...>",
 		      cmd_rpmsg_send, 2, SHELL_OPT_ARG_CHECK_SKIP),
+	SHELL_CMD_ARG(bulk, NULL,
+		      "Send a test pattern through the bulk region: rpmsg bulk <bytes>[K|M]",
+		      cmd_rpmsg_bulk, 2, 0),
 	SHELL_SUBCMD_SET_END);
 SHELL_CMD_REGISTER(rpmsg, &sub_rpmsg, "RPMsg commands", NULL);
 
@@ -213,6 +356,14 @@ int main(void)
 		return ret;
 	}
 	printk("OpenAMP: endpoint \"%s\" announced, waiting for messages\n", RPMSG_SERVICE_NAME);
+
+	ret = rpmsg_create_ept(&bulk_ept, rdev, RPMSG_BULK_SERVICE_NAME, RPMSG_ADDR_ANY,
+			       RPMSG_ADDR_ANY, bulk_endpoint_cb, NULL);
+	if (ret) {
+		printk("OpenAMP: rpmsg_create_ept (bulk) failed: %d\n", ret);
+		return ret;
+	}
+	printk("OpenAMP: endpoint \"%s\" announced\n", RPMSG_BULK_SERVICE_NAME);
 
 	while (1) {
 		k_sem_take(&kick_sem, K_FOREVER);

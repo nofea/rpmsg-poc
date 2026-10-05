@@ -5,15 +5,22 @@
  *
  * Flow: wait for the R5F to publish its resource table, initialize the vrings
  * and buffers (sets DRIVER_OK), wait for the R5F's name service announcement
- * and send a zero-length message so the R5F learns our endpoint address. Then:
+ * and send a zero-length message so the R5F learns our endpoint address. This
+ * is done for both endpoints: "rpmsg-client-sample" carries text messages,
+ * "rpmsg-bulk" carries descriptors of payloads in the bulk region (see
+ * common/rpmsg_bulk.h). Then:
  *
- *   am64_rpmsg_userspace <msg> [<msg> ...]   send each argument as a message,
- *                                            print replies until idle for 2 s
- *   am64_rpmsg_userspace                     interactive: send each stdin line,
- *                                            print incoming messages, exit on
- *                                            "quit" or EOF
+ *   am64_rpmsg_userspace <arg> [<arg> ...]   send each argument as a message,
+ *                                            or "--bulk <file>" as a bulk
+ *                                            payload, print replies until idle
+ *                                            for 2 s
+ *   am64_rpmsg_userspace                     interactive: send each stdin line
+ *                                            ("/bulk <file>" sends a file as a
+ *                                            bulk payload), print incoming
+ *                                            messages, exit on "quit" or EOF
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -27,11 +34,13 @@
 #include <metal/sys.h>
 #include <openamp/open_amp.h>
 #include <openamp/remoteproc.h>
+#include "rpmsg_bulk.h"
 
 #define BUS_NAME     "platform"
 #define RSC_DEV_NAME "a0100000.rsc_table"
 #define SHM_DEV_NAME "a5000000.shm"
 #define IPI_DEV_NAME "ff340000.ipi"
+#define BULK_DEV_NAME "a8000000.bulk"
 
 /* ZynqMP IPI registers of the APU's channel 7 */
 #define IPI_TRIG_OFFSET 0x00
@@ -53,12 +62,14 @@
 #define CLI_IDLE_MS         2000
 #define POLL_INTERVAL_MS    1
 #define LINE_BUF_SIZE       1024
+#define BULK_RELEASE_TIMEOUT_S 60
+#define BULK_CHUNK_SIZE     65536
 
 #define LOG(fmt, ...) printf("am64_rpmsg_userspace: " fmt "\n", ##__VA_ARGS__)
 
 struct platform {
-	struct metal_device *rsc_dev, *shm_dev, *ipi_dev;
-	struct metal_io_region *rsc_io, *shm_io, *ipi_io;
+	struct metal_device *rsc_dev, *shm_dev, *ipi_dev, *bulk_dev;
+	struct metal_io_region *rsc_io, *shm_io, *ipi_io, *bulk_io;
 	struct remoteproc_mem rsc_mem, shm_mem;
 	atomic_int kicked;
 };
@@ -67,9 +78,13 @@ static struct platform plat;
 static struct remoteproc rproc;
 static struct rpmsg_virtio_device rvdev;
 static struct rpmsg_virtio_shm_pool shpool;
-static struct rpmsg_endpoint ept;
-static int ept_bound;
+static struct rpmsg_endpoint ept, bulk_ept;
+static int ept_bound, bulk_ept_bound;
 static long last_activity_ms;
+
+/* Set while our A53->R5F area holds a payload the R5F hasn't released */
+static int bulk_in_flight;
+static uint32_t bulk_next_id = 1;
 
 static int ipi_irq_handler(int vector, void *priv)
 {
@@ -126,17 +141,124 @@ static int endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
 	return RPMSG_SUCCESS;
 }
 
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
+	static uint32_t table[256];
+	size_t i;
+
+	if (!table[1]) {
+		for (i = 0; i < 256; i++) {
+			uint32_t c = i;
+			int k;
+
+			for (k = 0; k < 8; k++)
+				c = (c >> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+			table[i] = c;
+		}
+	}
+
+	crc = ~crc;
+	for (i = 0; i < len; i++)
+		crc = table[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
+	return ~crc;
+}
+
+static int bulk_send_ctrl(uint32_t type, uint32_t id, uint32_t offset, uint32_t len,
+			  uint32_t crc)
+{
+	struct rpmsg_bulk_msg msg = {
+		.type = type, .id = id, .offset = offset, .len = len, .crc32 = crc,
+	};
+
+	return rpmsg_send(&bulk_ept, &msg, sizeof(msg));
+}
+
+/*
+ * The bulk region is mapped uncached (device memory), so it is only accessed
+ * through metal_io_block_read/write, which keep the accesses aligned.
+ */
+static uint32_t bulk_crc(unsigned long offset, size_t len)
+{
+	static uint8_t chunk[BULK_CHUNK_SIZE];
+	uint32_t crc = 0;
+
+	while (len) {
+		size_t n = len < sizeof(chunk) ? len : sizeof(chunk);
+
+		metal_io_block_read(plat.bulk_io, offset, chunk, n);
+		crc = crc32_update(crc, chunk, n);
+		offset += n;
+		len -= n;
+	}
+	return crc;
+}
+
+/* The R5F wrote a payload into its area: check it in place, then release it */
+static int bulk_endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len,
+			    uint32_t src, void *priv)
+{
+	struct rpmsg_bulk_msg msg;
+	uint32_t crc;
+
+	(void)ept;
+	(void)src;
+	(void)priv;
+	if (len != sizeof(msg)) {
+		LOG("dropped bulk message with bad length %zu", len);
+		return RPMSG_SUCCESS;
+	}
+	memcpy(&msg, data, sizeof(msg));
+	last_activity_ms = now_ms();
+
+	switch (msg.type) {
+	case RPMSG_BULK_XFER:
+		if (msg.offset < RPMSG_BULK_R5F_TX_OFFSET || msg.len > RPMSG_BULK_MAX_LEN ||
+		    msg.offset - RPMSG_BULK_R5F_TX_OFFSET > RPMSG_BULK_MAX_LEN - msg.len) {
+			LOG("dropped bulk %u outside the R5F area (offset 0x%x, len %u)",
+			    msg.id, msg.offset, msg.len);
+			return RPMSG_SUCCESS;
+		}
+		crc = bulk_crc(msg.offset, msg.len);
+		LOG("received bulk %u: %u bytes, crc 0x%08x %s", msg.id, msg.len, crc,
+		    crc == msg.crc32 ? "OK" : "MISMATCH");
+		if (bulk_send_ctrl(RPMSG_BULK_RELEASE, msg.id, 0, 0, 0) < 0)
+			LOG("failed to release bulk %u", msg.id);
+		break;
+	case RPMSG_BULK_RELEASE:
+		bulk_in_flight = 0;
+		LOG("bulk %u released", msg.id);
+		break;
+	default:
+		LOG("dropped bulk message with unknown type %u", msg.type);
+		break;
+	}
+	return RPMSG_SUCCESS;
+}
+
 static void ns_bind_cb(struct rpmsg_device *rdev, const char *name, uint32_t dest)
 {
-	LOG("name service announcement: \"%s\" at address 0x%x", name, dest);
-	if (strcmp(name, RPMSG_SERVICE_NAME))
-		return;
+	struct rpmsg_endpoint *e;
+	rpmsg_ept_cb cb;
+	int *bound;
 
-	if (rpmsg_create_ept(&ept, rdev, name, RPMSG_ADDR_ANY, dest, endpoint_cb, NULL)) {
-		LOG("failed to create endpoint");
+	LOG("name service announcement: \"%s\" at address 0x%x", name, dest);
+	if (!strcmp(name, RPMSG_SERVICE_NAME)) {
+		e = &ept;
+		cb = endpoint_cb;
+		bound = &ept_bound;
+	} else if (!strcmp(name, RPMSG_BULK_SERVICE_NAME)) {
+		e = &bulk_ept;
+		cb = bulk_endpoint_cb;
+		bound = &bulk_ept_bound;
+	} else {
 		return;
 	}
-	ept_bound = 1;
+
+	if (rpmsg_create_ept(e, rdev, name, RPMSG_ADDR_ANY, dest, cb, NULL)) {
+		LOG("failed to create endpoint \"%s\"", name);
+		return;
+	}
+	*bound = 1;
 }
 
 static int open_uio(const char *name, struct metal_device **dev, struct metal_io_region **io)
@@ -219,14 +341,92 @@ static int send_msg(const char *text, size_t len)
 	return 0;
 }
 
-/* Send each argument, then print incoming messages until idle for CLI_IDLE_MS */
+/* Process kicks until the R5F has released our last bulk payload */
+static int wait_bulk_released(void)
+{
+	long deadline = now_ms() + BULK_RELEASE_TIMEOUT_S * 1000L;
+
+	while (bulk_in_flight && now_ms() < deadline)
+		wait_for_events(-1);
+	if (bulk_in_flight) {
+		LOG("timed out waiting for the R5F to release the bulk payload");
+		return -1;
+	}
+	return 0;
+}
+
+/* Copy a file into our A53->R5F area and hand it to the R5F */
+static int send_bulk(const char *path)
+{
+	static uint8_t chunk[BULK_CHUNK_SIZE];
+	size_t len = 0;
+	uint32_t crc = 0, id;
+	ssize_t n;
+	int fd;
+
+	if (bulk_in_flight) {
+		LOG("previous bulk transfer still in flight");
+		return -1;
+	}
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		LOG("failed to open %s: %s", path, strerror(errno));
+		return -1;
+	}
+	while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+		if (len + n > RPMSG_BULK_MAX_LEN) {
+			LOG("%s is too large (max %d bytes)", path, RPMSG_BULK_MAX_LEN);
+			close(fd);
+			return -1;
+		}
+		metal_io_block_write(plat.bulk_io, RPMSG_BULK_A53_TX_OFFSET + len, chunk, n);
+		crc = crc32_update(crc, chunk, n);
+		len += n;
+	}
+	close(fd);
+	if (n < 0) {
+		LOG("failed to read %s: %s", path, strerror(errno));
+		return -1;
+	}
+	if (len == 0) {
+		LOG("%s is empty", path);
+		return -1;
+	}
+
+	/* The payload must be visible before the R5F sees the descriptor */
+	atomic_thread_fence(memory_order_seq_cst);
+	id = bulk_next_id++;
+	bulk_in_flight = 1;
+	if (bulk_send_ctrl(RPMSG_BULK_XFER, id, RPMSG_BULK_A53_TX_OFFSET, len, crc) < 0) {
+		bulk_in_flight = 0;
+		LOG("failed to send bulk descriptor");
+		return -1;
+	}
+	LOG("sent bulk %u: %zu bytes, crc 0x%08x", id, len, crc);
+	last_activity_ms = now_ms();
+	return 0;
+}
+
+/*
+ * Send each argument ("--bulk <file>" as a bulk payload), then print incoming
+ * messages until idle for CLI_IDLE_MS
+ */
 static int run_cli(int argc, char **argv)
 {
 	int i;
 
 	for (i = 1; i < argc; i++) {
-		if (send_msg(argv[i], strlen(argv[i])))
+		if (!strcmp(argv[i], "--bulk")) {
+			if (++i == argc) {
+				LOG("--bulk needs a file argument");
+				return -1;
+			}
+			if (send_bulk(argv[i]) || wait_bulk_released())
+				return -1;
+		} else if (send_msg(argv[i], strlen(argv[i]))) {
 			return -1;
+		}
 	}
 
 	while (now_ms() - last_activity_ms < CLI_IDLE_MS)
@@ -243,6 +443,14 @@ static int handle_line(const char *line, size_t len)
 		return 0;
 	if (len == 4 && !memcmp(line, "quit", 4))
 		return 1;
+	if (len > 6 && !memcmp(line, "/bulk ", 6)) {
+		char path[LINE_BUF_SIZE];
+
+		memcpy(path, line + 6, len - 6);
+		path[len - 6] = '\0';
+		send_bulk(path);
+		return 0;
+	}
 
 	send_msg(line, len);
 	return 0;
@@ -315,7 +523,8 @@ int main(int argc, char **argv)
 
 	if (open_uio(RSC_DEV_NAME, &plat.rsc_dev, &plat.rsc_io) ||
 	    open_uio(SHM_DEV_NAME, &plat.shm_dev, &plat.shm_io) ||
-	    open_uio(IPI_DEV_NAME, &plat.ipi_dev, &plat.ipi_io))
+	    open_uio(IPI_DEV_NAME, &plat.ipi_dev, &plat.ipi_io) ||
+	    open_uio(BULK_DEV_NAME, &plat.bulk_dev, &plat.bulk_io))
 		goto out;
 
 	irq = (intptr_t)plat.ipi_dev->irq_info;
@@ -354,22 +563,23 @@ int main(int argc, char **argv)
 		LOG("rpmsg_init_vdev failed");
 		goto out;
 	}
-	LOG("vrings ready, waiting for the R5F to announce \"%s\"", RPMSG_SERVICE_NAME);
+	LOG("vrings ready, waiting for the R5F to announce \"%s\" and \"%s\"",
+	    RPMSG_SERVICE_NAME, RPMSG_BULK_SERVICE_NAME);
 
 	deadline = now_ms() + NS_TIMEOUT_S * 1000L;
-	while (!ept_bound && now_ms() < deadline)
+	while (!(ept_bound && bulk_ept_bound) && now_ms() < deadline)
 		wait_for_events(-1);
-	if (!ept_bound) {
-		LOG("timed out waiting for the name service announcement");
-		goto out_vdev;
-	}
-
-	/* We bound straight to the R5F's address; tell it ours */
-	if (rpmsg_send(&ept, "", 0) < 0) {
-		LOG("failed to send the connect message");
+	if (!(ept_bound && bulk_ept_bound)) {
+		LOG("timed out waiting for the name service announcements");
 		goto out_ept;
 	}
-	LOG("connected to \"%s\"", RPMSG_SERVICE_NAME);
+
+	/* We bound straight to the R5F's addresses; tell it ours */
+	if (rpmsg_send(&ept, "", 0) < 0 || rpmsg_send(&bulk_ept, "", 0) < 0) {
+		LOG("failed to send the connect messages");
+		goto out_ept;
+	}
+	LOG("connected to \"%s\" and \"%s\"", RPMSG_SERVICE_NAME, RPMSG_BULK_SERVICE_NAME);
 
 	if ((argc > 1 ? run_cli(argc, argv) : run_interactive()))
 		goto out_ept;
@@ -378,8 +588,10 @@ int main(int argc, char **argv)
 	ret = 0;
 
 out_ept:
-	rpmsg_destroy_ept(&ept);
-out_vdev:
+	if (bulk_ept_bound)
+		rpmsg_destroy_ept(&bulk_ept);
+	if (ept_bound)
+		rpmsg_destroy_ept(&ept);
 	rpmsg_deinit_vdev(&rvdev);
 out:
 	if (irq >= 0) {
@@ -387,6 +599,8 @@ out:
 		metal_irq_disable(irq);
 		metal_irq_unregister(irq);
 	}
+	if (plat.bulk_dev)
+		metal_device_close(plat.bulk_dev);
 	if (plat.ipi_dev)
 		metal_device_close(plat.ipi_dev);
 	if (plat.shm_dev)

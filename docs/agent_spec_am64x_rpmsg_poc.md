@@ -108,6 +108,29 @@ Implement and verify an Asymmetric Multiprocessing (AMP) RPMsg stack using the O
      * Ping still works mid-session: type `ping` and expect `received "pong"`.
      * Type `quit` and expect `done`.
 
+### Phase 6: Bulk Transfers (MB-Range Payloads)
+
+**Agent Task:** RPMsg payloads are capped at 496 bytes. Add a bulk channel for payloads of up to 8 MB that uses RPMsg only for control and keeps the payload in shared memory (zero-copy, the pattern TI recommends for AM64x). The text endpoint and its behavior stay unchanged.
+
+1. **Memory:** a 16 MB region at `0xA8000000`, declared in the Renode platform, the Zephyr overlay and the Linux DT overlay (`generic-uio`, opened as `a8000000.bulk`). It is split by direction, and each side writes only its own area: A53→R5F at `+0x0` and R5F→A53 at `+0x800000`, 8 MB each.
+2. **Control endpoint:** Zephyr creates a second endpoint, `rpmsg-bulk`. The A53 waits for both name-service announcements and sends a zero-length connect message on each.
+3. **Protocol** (`common/rpmsg_bulk.h`): `struct rpmsg_bulk_msg { type, id, offset, len, crc32 }`, all `uint32_t`.
+   * `XFER`: the sender has written `len` bytes at `offset` in its own area. It issues a write barrier before sending the descriptor.
+   * The receiver validates the range against the sender's area, computes the IEEE CRC32 in place, logs the result, and answers `RELEASE` with the same id.
+   * Only one transfer per direction is in flight. A new send is refused until `RELEASE` arrives. Malformed descriptors are logged and dropped.
+4. **Linux app:**
+   * `--bulk <file>` in CLI mode, processed in order with the text arguments. The app waits for `RELEASE` before continuing.
+   * `/bulk <file>` in interactive mode.
+   * Output lines: `sent bulk <id>: <len> bytes, crc 0x<crc>`, `received bulk <id>: <len> bytes, crc 0x<crc> OK|MISMATCH`, `bulk <id> released`.
+5. **Zephyr:**
+   * `rpmsg bulk <n>[K|M]` fills the R5F→A53 area with a test pattern and logs `OpenAMP: Sent bulk <id>: <len> bytes, crc 0x<crc>`.
+   * Received payloads are logged as `OpenAMP: Received bulk <id>: <len> bytes, crc 0x<crc> OK|MISMATCH`.
+6. **Acceptance test:** a third test case.
+   * Create a 1 MB `/tmp/blob` with `dd`, send it with `/bulk`, and expect `OK` on Zephyr and `bulk 1 released` on Linux.
+   * Run `rpmsg bulk 2M` and expect `OK` on Linux and `OpenAMP: bulk 1 released` on Zephyr.
+   * Ping/pong, then `quit`.
+7. **Real hardware:** the region must be non-cacheable for the R5F (MPU), or the code must do explicit cache maintenance. UIO already maps it uncached on Linux.
+
 ## 3. Constraints & Fallbacks
 * **UIO Mapping:** The A53 userspace code must explicitly use `metal_device_open()` to map the UIO device exposed by the Linux kernel (typically `/dev/uio0`).
 * **Rootfs Injection:** To avoid building a full Linux image, instruct Renode to inject the compiled `am64_rpmsg_userspace` binary directly into the virtual guest's root filesystem (using Renode's `sysbus LoadELF` or guest agent transfer mechanisms) before execution.

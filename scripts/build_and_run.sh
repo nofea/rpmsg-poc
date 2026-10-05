@@ -41,7 +41,7 @@ echo "=== 2. Zephyr firmware for the R5F"
 
 echo "=== 3. A53 userspace app"
 aarch64-linux-gnu-gcc -O2 -Wall -static -DVIRTIO_DRIVER_SUPPORT=1 \
-    -o linux_app/am64_rpmsg_userspace linux_app/am64_rpmsg_userspace.c \
+    -Icommon -o linux_app/am64_rpmsg_userspace linux_app/am64_rpmsg_userspace.c \
     -lopen_amp -lmetal -lsysfs -lpthread -lrt
 
 echo "=== 4. Linux device tree"

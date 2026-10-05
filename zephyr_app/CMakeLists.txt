@@ -3,3 +3,4 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(am64x_rpmsg_poc)
 
 target_sources(app PRIVATE src/main.c src/rsc_table.c)
+target_include_directories(app PRIVATE ../common)
