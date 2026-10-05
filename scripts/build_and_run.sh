@@ -6,14 +6,16 @@
 #
 # mode: test        (default) headless acceptance test, renode/rpmsg_poc.robot
 #       interactive  Renode console with the simulation running; the Linux
-#                    console (uart1) is served on TCP port 3456 (publish it with
-#                    -p 3456:3456), log in as root and run /root/am64_rpmsg_userspace
+#                    console (uart1) is served on TCP port 3456 and the Zephyr
+#                    shell (uart0) on 3457 (publish them with -p 3456:3456
+#                    -p 3457:3457), log in as root and run /root/am64_rpmsg_userspace
 #       build        build only
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODE=${1:-test}
 LINUX_CONSOLE_PORT=3456
+ZEPHYR_CONSOLE_PORT=3457
 ZEPHYR_VERSION=v4.5.0-rc1
 BUILD=build
 DOWNLOADS=$BUILD/downloads
@@ -75,10 +77,12 @@ build)
     echo "=== Build complete"
     ;;
 interactive)
-    echo "=== 6. Renode (interactive); Linux console on TCP port $LINUX_CONSOLE_PORT"
+    echo "=== 6. Renode (interactive); Linux console on TCP port $LINUX_CONSOLE_PORT, Zephyr shell on $ZEPHYR_CONSOLE_PORT"
     renode --console -e "include @renode/run_poc.resc; \
         emulation CreateServerSocketTerminal $LINUX_CONSOLE_PORT \"linux_console\" false; \
-        connector Connect sysbus.uart1 linux_console; start"
+        connector Connect sysbus.uart1 linux_console; \
+        emulation CreateServerSocketTerminal $ZEPHYR_CONSOLE_PORT \"zephyr_console\" false; \
+        connector Connect sysbus.uart0 zephyr_console; start"
     ;;
 test)
     echo "=== 6. Renode acceptance test"

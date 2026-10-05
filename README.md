@@ -7,16 +7,16 @@ Proof of concept for an OpenAMP/RPMsg link between an application core and a rea
 
 Everything runs in the [Renode](https://renode.io) simulator. Renode has no AM64x model, so a **Xilinx ZynqMP** platform stands in for it, which also has Cortex-A53 and Cortex-R5F cores. The ZynqMP **IPI** (inter-processor interrupt) block stands in for the AM64x hardware mailbox.
 
-The design spec is [docs/antigravity_agent_spec_am64x_rpmsg_poc.md](docs/antigravity_agent_spec_am64x_rpmsg_poc.md).
+The design spec is [docs/agent_spec_am64x_rpmsg_poc.md](docs/agent_spec_am64x_rpmsg_poc.md).
 
 ## What the POC does
 
 1. Zephyr boots on the R5F, publishes its resource table to a fixed shared-memory address and waits.
 2. Linux boots on the A53. The userspace app `am64_rpmsg_userspace` maps the resource table, the shared SRAM and the IPI registers through UIO. It sets up the vrings and buffers and signals the R5F that they're ready.
-3. Zephyr announces the `rpmsg-client-sample` endpoint. The app binds to it and sends `"ping"`.
-4. Zephyr prints `OpenAMP: Received message: "ping"` and replies `"pong"`, which the app prints.
+3. Zephyr announces the `rpmsg-client-sample` endpoint. The app binds to it and sends a zero-length message, which tells Zephyr the app's endpoint address.
+4. Text messages can then go both ways. Zephyr answers `"ping"` with `"pong"` and only logs every other message.
 
-Expected console output:
+Expected console output for `am64_rpmsg_userspace ping`:
 
 ```
 # Linux (uart1)
@@ -27,6 +27,14 @@ am64_rpmsg_userspace: received "pong"
 OpenAMP: Received message: "ping"
 OpenAMP: Sent reply: "pong"
 ```
+
+### Custom messages
+
+Messages are plain text, up to 496 bytes each.
+
+- **Linux to Zephyr, CLI mode:** `am64_rpmsg_userspace <msg> [<msg> ...]` sends each argument as one message (quote the ones with spaces). It prints incoming messages until 2 s pass with none, then exits.
+- **Linux to Zephyr, interactive mode:** `am64_rpmsg_userspace` with no arguments sends each line you type and prints incoming messages as they arrive. Exit with `quit` or Ctrl-D.
+- **Zephyr to Linux:** the Zephyr shell runs on uart0. `rpmsg send <text...>` sends the text to the app. It only works while the app is running, because Zephyr learns the app's address from its connect message.
 
 ## Requirements
 
@@ -60,10 +68,10 @@ This builds everything and runs the automated acceptance test ([renode/rpmsg_poc
 ### Running it by hand
 
 ```bash
-docker run --rm -it -p 3456:3456 -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh interactive
+docker run --rm -it -p 3456:3456 -p 3457:3457 -v "$PWD":/workspace rpmsg-poc ./scripts/build_and_run.sh interactive
 ```
 
-The Renode monitor runs in that terminal, and its log shows both UARTs: `uart1` is Linux and `uart0` is Zephyr. The Linux console is also served on TCP port 3456. Once the log shows `Machine started`, connect to it from a second terminal:
+The Renode monitor runs in that terminal, and its log shows both UARTs: `uart1` is Linux and `uart0` is Zephyr. The Linux console is also served on TCP port 3456, and the Zephyr shell on port 3457. Once the log shows `Machine started`, connect to it from a second terminal:
 
 ```bash
 telnet 127.0.0.1 3456        # or: nc 127.0.0.1 3456
@@ -76,14 +84,16 @@ The console only serves one client at a time and doesn't replay earlier output, 
 At `buildroot login:`, log in as `root` (no password) and run:
 
 ```sh
-/root/am64_rpmsg_userspace
+/root/am64_rpmsg_userspace          # interactive session
+/root/am64_rpmsg_userspace ping     # or: one-shot, prints "pong"
 ```
 
 The Zephyr side of the exchange appears as `uart0` lines in the Renode log. Type `quit` in the Renode monitor to exit.
 
 Notes:
 - Type commands rather than pasting them. The simulated UART drops characters when a whole line arrives in one burst.
-- The app does one exchange per simulation boot, so restart the simulation to run it again.
+- The app does one session per simulation boot (one CLI run or one interactive session), so restart the simulation to run it again.
+- The Zephyr shell (`uart0`) is served on TCP port 3457. Connect with `telnet 127.0.0.1 3457`, press **Enter** to get the `uart:~$` prompt, and type `rpmsg send <text>` while the app is running.
 
 ## How it is built
 
@@ -123,6 +133,7 @@ Dockerfile   build/run environment
 
 - **Simulated stand-in, not AM64x hardware.** The ZynqMP IPI replaces the TI mailbox, and the addresses are chosen for the ZynqMP platform. Porting to a real AM6442 means swapping the doorbell (TI mailbox) and the memory map.
 - **No remoteproc loading.** Renode loads the R5F firmware directly, and Zephyr copies its resource table to a fixed address that Linux maps.
-- **One exchange per boot.** The Zephyr side doesn't handle a virtio reset.
+- **One session per boot.** The Zephyr side doesn't handle a virtio reset.
+- **Zephyr sends after the app exits are lost.** Zephyr keeps the app's address, so `rpmsg send` still fills vring buffers that nobody reads. Once the buffers run out, it times out with an error.
 - **Renode IPI quirk.** `renode/run_poc.resc` installs a hook because Renode's `ZynqMP_IPI` model doesn't implement write-1-to-clear on its status registers. Without it, the R5F gets stuck in an interrupt storm.
 - **External images.** The Linux kernel, firmware and rootfs are Antmicro's prebuilt ZynqMP OpenAMP demo images, downloaded from `dl.antmicro.com`.

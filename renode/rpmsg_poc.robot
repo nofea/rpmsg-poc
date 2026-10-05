@@ -2,6 +2,10 @@
 Acceptance test for the AM64x RPMsg POC. Run from the repository root:
     renode-test renode/rpmsg_poc.robot
 
+*** Settings ***
+# Each test needs a fresh boot: the R5F handles one RPMsg session per boot
+Test Setup                  Reset Emulation
+
 *** Variables ***
 ${LINUX_UART}       sysbus.uart1
 ${ZEPHYR_UART}      sysbus.uart0
@@ -16,18 +20,46 @@ Create POC Machine
     ${zephyr}=                  Create Terminal Tester      ${ZEPHYR_UART}  defaultPauseEmulation=true
     RETURN                      ${linux}  ${zephyr}
 
-*** Test Cases ***
-Should Exchange RPMsg Between A53 Linux And R5F Zephyr
+Boot And Log In
     ${linux}  ${zephyr}=        Create POC Machine
-
     Wait For Line On Uart       OpenAMP: waiting for the A53 to initialize the virtio device    testerId=${zephyr}
-
     Wait For Prompt On Uart     buildroot login:            testerId=${linux}   timeout=300
     Write Line To Uart          root                        testerId=${linux}
     Wait For Prompt On Uart     ${LINUX_PROMPT}             testerId=${linux}
+    RETURN                      ${linux}  ${zephyr}
 
-    Write Line To Uart          ${APP}                      testerId=${linux}
+*** Test Cases ***
+Should Exchange RPMsg Between A53 Linux And R5F Zephyr
+    ${linux}  ${zephyr}=        Boot And Log In
+
+    Write Line To Uart          ${APP} ping                 testerId=${linux}
     Wait For Line On Uart       am64_rpmsg_userspace: sent "ping"                   testerId=${linux}   timeout=120
     Wait For Line On Uart       OpenAMP: Received message: "ping"                   testerId=${zephyr}  timeout=60
     Wait For Line On Uart       am64_rpmsg_userspace: received "pong"               testerId=${linux}   timeout=60
+    Wait For Line On Uart       am64_rpmsg_userspace: done                          testerId=${linux}   timeout=60
+
+Should Exchange Custom Messages In Both Directions
+    ${linux}  ${zephyr}=        Boot And Log In
+
+    Write Line To Uart          ${APP}                      testerId=${linux}
+    Wait For Line On Uart       OpenAMP: A53 connected                              testerId=${zephyr}  timeout=120
+    Wait For Line On Uart       am64_rpmsg_userspace: interactive mode              testerId=${linux}   timeout=60
+
+    # Linux -> Zephyr, no automatic reply
+    Write Line To Uart          hello from linux            testerId=${linux}
+    Wait For Line On Uart       am64_rpmsg_userspace: sent "hello from linux"       testerId=${linux}   timeout=60
+    Wait For Line On Uart       OpenAMP: Received message: "hello from linux"       testerId=${zephyr}  timeout=60
+    Should Not Be On Uart       OpenAMP: Sent reply         testerId=${zephyr}  timeout=2
+
+    # Zephyr -> Linux
+    Write Line To Uart          rpmsg send hello from zephyr    testerId=${zephyr}
+    Wait For Line On Uart       OpenAMP: Sent message: "hello from zephyr"          testerId=${zephyr}  timeout=60
+    Wait For Line On Uart       am64_rpmsg_userspace: received "hello from zephyr"  testerId=${linux}   timeout=60
+
+    # ping -> pong still works mid-session
+    Write Line To Uart          ping                        testerId=${linux}
+    Wait For Line On Uart       OpenAMP: Received message: "ping"                   testerId=${zephyr}  timeout=60
+    Wait For Line On Uart       am64_rpmsg_userspace: received "pong"               testerId=${linux}   timeout=60
+
+    Write Line To Uart          quit                        testerId=${linux}
     Wait For Line On Uart       am64_rpmsg_userspace: done                          testerId=${linux}   timeout=60

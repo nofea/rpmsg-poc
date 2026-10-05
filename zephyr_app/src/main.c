@@ -3,6 +3,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/mbox.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/printk.h>
 #include <openamp/open_amp.h>
 #include <metal/sys.h>
@@ -10,7 +12,11 @@
 #include "rsc_table.h"
 
 #define RPMSG_SERVICE_NAME "rpmsg-client-sample"
+#define PING_MSG           "ping"
 #define REPLY_MSG          "pong"
+
+/* 512-byte RPMsg buffer minus the 16-byte RPMsg header */
+#define MAX_PAYLOAD 496
 
 #define SHM_NODE DT_CHOSEN(zephyr_ipc_shm)
 #define SHM_ADDR DT_REG_ADDR(SHM_NODE)
@@ -29,6 +35,9 @@ static struct metal_io_region rsc_io;
 
 static struct rpmsg_virtio_device rvdev;
 static struct rpmsg_endpoint ept;
+
+/* Set once a message from the A53 has told us its endpoint address */
+static atomic_t a53_connected;
 
 static void mbox_rx_callback(const struct device *dev, mbox_channel_id_t channel_id,
 			     void *user_data, struct mbox_msg *data)
@@ -52,16 +61,74 @@ static int mailbox_notify(void *priv, uint32_t id)
 static int endpoint_cb(struct rpmsg_endpoint *ept, void *data, size_t len, uint32_t src,
 		       void *priv)
 {
+	/* OpenAMP has now filled ept->dest_addr with the A53's address */
+	if (!atomic_set(&a53_connected, 1)) {
+		printk("OpenAMP: A53 connected (addr 0x%x)\n", src);
+	}
+
+	/* A zero-length message only announces the A53's endpoint */
+	if (len == 0) {
+		return RPMSG_SUCCESS;
+	}
+
 	printk("OpenAMP: Received message: \"%.*s\"\n", (int)len, (char *)data);
 
-	if (rpmsg_send(ept, REPLY_MSG, strlen(REPLY_MSG)) < 0) {
-		printk("OpenAMP: failed to send reply\n");
-	} else {
-		printk("OpenAMP: Sent reply: \"%s\"\n", REPLY_MSG);
+	if (len == strlen(PING_MSG) && !memcmp(data, PING_MSG, len)) {
+		if (rpmsg_send(ept, REPLY_MSG, strlen(REPLY_MSG)) < 0) {
+			printk("OpenAMP: failed to send reply\n");
+		} else {
+			printk("OpenAMP: Sent reply: \"%s\"\n", REPLY_MSG);
+		}
 	}
 
 	return RPMSG_SUCCESS;
 }
+
+/*
+ * rpmsg send <text...>: runs in the shell thread. OpenAMP serializes vring
+ * access with the RPMsg device lock, so this can race with main()'s kick
+ * processing.
+ */
+static int cmd_rpmsg_send(const struct shell *sh, size_t argc, char **argv)
+{
+	char msg[MAX_PAYLOAD];
+	size_t len = 0;
+	int ret;
+
+	if (!atomic_get(&a53_connected)) {
+		shell_error(sh, "OpenAMP: A53 not connected, start am64_rpmsg_userspace first");
+		return -ENOTCONN;
+	}
+
+	for (size_t i = 1; i < argc; i++) {
+		size_t n = strlen(argv[i]);
+
+		if (len + (i > 1) + n > MAX_PAYLOAD) {
+			shell_error(sh, "OpenAMP: message too long (max %d bytes)", MAX_PAYLOAD);
+			return -EMSGSIZE;
+		}
+		if (i > 1) {
+			msg[len++] = ' ';
+		}
+		memcpy(&msg[len], argv[i], n);
+		len += n;
+	}
+
+	ret = rpmsg_send(&ept, msg, len);
+	if (ret < 0) {
+		shell_error(sh, "OpenAMP: failed to send message: %d", ret);
+		return -EIO;
+	}
+	shell_print(sh, "OpenAMP: Sent message: \"%.*s\"", (int)len, msg);
+
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_rpmsg,
+	SHELL_CMD_ARG(send, NULL, "Send a text message to the A53: rpmsg send <text...>",
+		      cmd_rpmsg_send, 2, SHELL_OPT_ARG_CHECK_SKIP),
+	SHELL_SUBCMD_SET_END);
+SHELL_CMD_REGISTER(rpmsg, &sub_rpmsg, "RPMsg commands", NULL);
 
 static struct virtio_device *create_vdev(struct am64_rsc_table *rsc)
 {
